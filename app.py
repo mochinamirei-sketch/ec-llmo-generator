@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from openai import OpenAI
+import anthropic
 
 
 APP_TITLE = "EC LLMO Generator"
@@ -89,11 +89,12 @@ def check_password() -> bool:
     return False
 
 
-def get_openai_client() -> Optional[OpenAI]:
-    api_key = get_secret("openai_api_key")
+def get_anthropic_client() -> Optional[anthropic.Anthropic]:
+    # mailmagwrite と同じ大文字キー(ANTHROPIC_API_KEY)でも読めるようにしている
+    api_key = get_secret("anthropic_api_key") or get_secret("ANTHROPIC_API_KEY")
     if not api_key:
         return None
-    return OpenAI(api_key=api_key)
+    return anthropic.Anthropic(api_key=api_key)
 
 
 def normalize_text(text: str, limit: int = 12000) -> str:
@@ -291,15 +292,15 @@ def build_user_prompt(task_key: str, product_context: str) -> str:
 
 
 def call_ai(task_key: str, product_context: str) -> str:
-    model = get_secret("openai_model", "gpt-5.5")
+    model = get_secret("anthropic_model", "claude-sonnet-5-5")
     user_prompt = build_user_prompt(task_key, product_context)
-    client = get_openai_client()
+    client = get_anthropic_client()
 
     if not client:
-        return f"""OpenAI APIキーが未設定です。
+        return f"""Anthropic APIキーが未設定です。
 
-`.streamlit/secrets.toml` に `openai_api_key` を設定すると、この画面から直接生成できます。
-当面は以下のプロンプトをChatGPT等に貼り付けて使えます。
+`.streamlit/secrets.toml`(Streamlit CloudならSecrets)に `anthropic_api_key` を設定すると、この画面から直接生成できます。
+当面は以下のプロンプトをClaude等に貼り付けて使えます。
 
 ## SYSTEM
 {system_prompt()}
@@ -309,17 +310,35 @@ def call_ai(task_key: str, product_context: str) -> str:
 """
 
     try:
-        response = client.responses.create(
+        response = client.messages.create(
             model=model,
-            instructions=system_prompt(),
-            input=user_prompt,
+            max_tokens=8000,
+            system=system_prompt(),
+            messages=[{"role": "user", "content": user_prompt}],
         )
-        return response.output_text
+        text = "".join(
+            block.text for block in response.content if getattr(block, "type", "") == "text"
+        )
+        if not text.strip():
+            raise RuntimeError("Claudeの応答にテキストが含まれていませんでした。")
+        return text
+    except anthropic.AuthenticationError:
+        return _error_text("Anthropic APIキーが正しくありません。Secretsの anthropic_api_key を確認してください。", user_prompt)
+    except anthropic.RateLimitError as exc:
+        return _error_text(f"リクエストが多すぎます。少し待ってからもう一度押してください。({exc})", user_prompt)
+    except anthropic.BadRequestError as exc:
+        if "credit balance" in str(exc).lower():
+            return _error_text("Anthropic APIの残高が不足しています。console.anthropic.com の Billing でクレジットを追加してください。", user_prompt)
+        return _error_text(str(exc), user_prompt)
     except Exception as exc:
-        return f"""生成に失敗しました。
+        return _error_text(str(exc), user_prompt)
+
+
+def _error_text(message: str, user_prompt: str) -> str:
+    return f"""生成に失敗しました。
 
 エラー:
-`{exc}`
+`{message}`
 
 ## 再実行用プロンプト
 {user_prompt}
