@@ -1,5 +1,5 @@
 streamlit
-openai
+anthropic
 requests
 beautifulsoup4
 pandas
