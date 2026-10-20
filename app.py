@@ -30,6 +30,7 @@ FORM_FIELDS = [
     ("product_name", "商品名"),
     ("sku", "SKU"),
     ("product_url", "商品URL"),
+    ("image_urls", "商品画像URL"),
     ("price", "販売価格"),
     ("price_variants", "価格バリエーション"),
     ("sale_start", "販売開始日"),
@@ -123,6 +124,7 @@ def fetch_page(url: str) -> Dict[str, Any]:
         "text": "",
         "price_like": [],
         "image_urls": [],
+        "og_image": "",
         "error": "",
     }
 
@@ -138,6 +140,10 @@ def fetch_page(url: str) -> Dict[str, Any]:
         meta_description = soup.find("meta", attrs={"name": "description"})
         if meta_description and meta_description.get("content"):
             result["description"] = meta_description["content"].strip()
+
+        og_image = soup.find("meta", attrs={"property": "og:image"})
+        if og_image and og_image.get("content"):
+            result["og_image"] = urljoin(url, og_image["content"].strip())
 
         image_urls: List[str] = []
         for image in soup.find_all("img"):
@@ -230,10 +236,16 @@ def task_instruction(task_key: str) -> str:
 Product構造化データを作成してください。
 script type="application/ld+json" 付きで、コピペ可能なコードブロックにしてください。
 価格バリエーションがある場合は offers 配列または AggregateOffer を適切に使い、要確認項目は無理に断定しないでください。
+image は Product の必須項目です。必ず含めてください。
+- 商品情報の「商品画像URL」(manual_product_info)に入力があれば、その中から商品が分かる画像を先頭からそのまま image に配列で入れてください。
+- 入力がなければ scraped_page_info の og_image、image_urls から商品写真らしきものを選んでください。ロゴ・アイコン・バナーは使わないでください。
+- 画像URLがどこにも見つからない場合も image を省略せず、"image": ["https://(要確認:商品画像URLを入れてください)"] のようなプレースホルダーを入れ、コードブロックの前後で「画像URLが未入力のため要確認」と明記してください。
+- 画像URLは商品情報にあるものだけを使い、推測で作らないでください。
 """,
         "04_rich_results": """
 Googleリッチリザルトテストで検査するためのチェック項目を作成してください。
 Product、Merchant listings、価格、在庫、送料、返品、画像、警告、エラーの観点を含めてください。
+「image がありません」の警告・エラーが出た場合の直し方(画像URLの入れ方、複数画像の配列、絶対URLにすること)も含めてください。
 """,
         "05_search_console": """
 Google Search ConsoleでURL検査・インデックス登録をリクエストするためのチェック項目を作成してください。
@@ -312,7 +324,7 @@ def call_ai(task_key: str, product_context: str) -> str:
     try:
         response = client.messages.create(
             model=model,
-            max_tokens=8000,
+            max_tokens=16000,
             system=system_prompt(),
             messages=[{"role": "user", "content": user_prompt}],
         )
@@ -320,7 +332,11 @@ def call_ai(task_key: str, product_context: str) -> str:
             block.text for block in response.content if getattr(block, "type", "") == "text"
         )
         if not text.strip():
-            raise RuntimeError("Claudeの応答にテキストが含まれていませんでした。")
+            types_seen = [getattr(b, "type", "?") for b in response.content]
+            raise RuntimeError(
+                "Claudeの応答にテキストが含まれていませんでした。"
+                f" (model={model}, stop_reason={getattr(response, 'stop_reason', None)}, content={types_seen})"
+            )
         return text
     except anthropic.AuthenticationError:
         return _error_text("Anthropic APIキーが正しくありません。Secretsの anthropic_api_key を確認してください。", user_prompt)
@@ -353,6 +369,21 @@ def text_area_with_default(label: str, key: str, default: str = "", height: int 
     return st.text_area(label, value=default, height=height, key=f"field_{key}")
 
 
+def default_image_urls(page_data: Optional[Dict[str, Any]]) -> str:
+    """og:image を先頭に、アイコンやロゴらしきものを除いた画像URLを最大5件返す。"""
+    if not page_data:
+        return ""
+    skip_words = ("icon", "logo", "spacer", "blank", "banner", "btn", "button", "sprite", "arrow")
+    urls: List[str] = []
+    if page_data.get("og_image"):
+        urls.append(page_data["og_image"])
+    for image_url in page_data.get("image_urls", []):
+        if any(word in image_url.lower() for word in skip_words):
+            continue
+        urls.append(image_url)
+    return "\n".join(list(dict.fromkeys(urls))[:5])
+
+
 def build_product_form(mode: str, page_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     st.subheader("商品情報")
     if mode == "既存商品ページから作る":
@@ -361,12 +392,16 @@ def build_product_form(mode: str, page_data: Optional[Dict[str, Any]]) -> Dict[s
     title_default = (page_data or {}).get("title", "")
     url_default = (page_data or {}).get("url", "")
     price_default = " / ".join((page_data or {}).get("price_like", [])[:5])
+    image_default = default_image_urls(page_data)
 
     col1, col2 = st.columns(2)
     with col1:
         product_name = text_input_with_default("商品名", "product_name", title_default)
         sku = text_input_with_default("SKU", "sku")
         product_url = text_input_with_default("商品URL", "product_url", url_default)
+        image_urls_text = text_area_with_default(
+            "商品画像URL(1行に1件。メイン画像を先頭に)", "image_urls", image_default, height=110
+        )
         price = text_input_with_default("販売価格", "price", price_default)
         price_variants = text_area_with_default("価格バリエーション", "price_variants")
         sale_start = text_input_with_default("販売開始日", "sale_start")
@@ -407,6 +442,7 @@ def build_product_form(mode: str, page_data: Optional[Dict[str, Any]]) -> Dict[s
         "商品名": product_name,
         "SKU": sku,
         "商品URL": product_url,
+        "商品画像URL": image_urls_text,
         "販売価格": price,
         "価格バリエーション": price_variants,
         "販売開始日": sale_start,
